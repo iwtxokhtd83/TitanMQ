@@ -110,6 +110,7 @@ public class LogSegment {
     public long size() { return currentPosition; }
     public long baseOffset() { return baseOffset; }
     public long endOffset() { return endOffset; }
+    public Path filePath() { return filePath; }
 
     public void close() throws IOException {
         channel.close();

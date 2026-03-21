@@ -78,6 +78,8 @@ titanmq/
 
 ## Quick Start
 
+### Networked Mode (Kafka-style)
+
 ```java
 // Producer
 TitanProducer producer = TitanMQ.newProducer()
@@ -99,6 +101,36 @@ consumer.subscribe(message -> {
     process(message);
     message.ack();
 });
+```
+
+### Embedded/Brokerless Mode (ZeroMQ-style)
+
+```java
+// No separate broker process needed — runs entirely in-process
+EmbeddedBroker broker = EmbeddedBroker.builder()
+    .dataDir(Path.of("/tmp/titanmq"))
+    .numPartitions(4)
+    .build()
+    .start();
+
+EmbeddedProducer producer = broker.createProducer();
+producer.send("events", "key-1", "payload".getBytes());
+
+EmbeddedConsumer consumer = broker.createConsumer("my-group", "events");
+consumer.subscribe(msg -> System.out.println(new String(msg.payload())));
+```
+
+### Cluster Mode (with Raft consensus)
+
+```bash
+# Node 1
+java -jar titanmq-server.jar --node-id broker-1 --port 9500 --peers broker-2,broker-3
+
+# Node 2
+java -jar titanmq-server.jar --node-id broker-2 --port 9501 --peers broker-1,broker-3
+
+# Node 3
+java -jar titanmq-server.jar --node-id broker-3 --port 9502 --peers broker-1,broker-2
 ```
 
 ## Building

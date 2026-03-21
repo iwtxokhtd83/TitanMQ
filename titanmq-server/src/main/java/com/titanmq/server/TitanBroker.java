@@ -10,6 +10,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 /**
@@ -37,6 +38,10 @@ public class TitanBroker {
     private BrokerNetworkServer networkServer;
 
     public TitanBroker(BrokerConfig config) {
+        this(config, "broker-1", List.of());
+    }
+
+    public TitanBroker(BrokerConfig config, String nodeId, List<String> peers) {
         this.config = config;
         this.topicManager = new TopicManager(config);
         this.offsetStore = new OffsetStore();
@@ -45,7 +50,7 @@ public class TitanBroker {
                 config.backPressureHighWaterMark(),
                 config.backPressureLowWaterMark()
         );
-        this.raftNode = new RaftNode("broker-1", List.of());
+        this.raftNode = new RaftNode(nodeId, peers);
     }
 
     public void start() throws IOException, InterruptedException {
@@ -79,6 +84,8 @@ public class TitanBroker {
 
     public static void main(String[] args) throws Exception {
         BrokerConfig config = new BrokerConfig();
+        String nodeId = "broker-1";
+        List<String> peers = new ArrayList<>();
 
         // Parse CLI args
         for (int i = 0; i < args.length; i++) {
@@ -86,10 +93,12 @@ public class TitanBroker {
                 case "--port" -> config.port(Integer.parseInt(args[++i]));
                 case "--data-dir" -> config.dataDir(java.nio.file.Path.of(args[++i]));
                 case "--partitions" -> config.numPartitions(Integer.parseInt(args[++i]));
+                case "--node-id" -> nodeId = args[++i];
+                case "--peers" -> peers.addAll(List.of(args[++i].split(",")));
             }
         }
 
-        TitanBroker broker = new TitanBroker(config);
+        TitanBroker broker = new TitanBroker(config, nodeId, peers);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try { broker.shutdown(); } catch (IOException e) { log.error("Error during shutdown", e); }
         }));
