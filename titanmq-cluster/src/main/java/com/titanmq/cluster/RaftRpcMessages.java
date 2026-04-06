@@ -133,20 +133,37 @@ public final class RaftRpcMessages {
 
     // ─── AppendEntries Response ───
 
+    /**
+     * Response to AppendEntries RPC.
+     *
+     * <p>When success=false, includes conflict information for optimized backtracking
+     * (§5.3 optimization from the Raft paper). Instead of the leader decrementing
+     * nextIndex by 1 per rejected RPC (O(n) round trips for n divergent entries),
+     * the follower returns:
+     * <ul>
+     *   <li>conflictIndex: the first index of the conflicting term (or log length if too short)</li>
+     *   <li>conflictTerm: the term of the conflicting entry (0 if log is too short)</li>
+     * </ul>
+     * This lets the leader skip directly to the divergence point in one round trip.
+     */
     public record AppendEntriesResponse(
             long term,
             boolean success,
             String followerId,
-            long matchIndex
+            long matchIndex,
+            long conflictIndex,
+            long conflictTerm
     ) {
         public byte[] serialize() {
             byte[] followerBytes = followerId.getBytes();
-            ByteBuffer buf = ByteBuffer.allocate(8 + 1 + 4 + followerBytes.length + 8);
+            ByteBuffer buf = ByteBuffer.allocate(8 + 1 + 4 + followerBytes.length + 8 + 8 + 8);
             buf.putLong(term);
             buf.put((byte) (success ? 1 : 0));
             buf.putInt(followerBytes.length);
             buf.put(followerBytes);
             buf.putLong(matchIndex);
+            buf.putLong(conflictIndex);
+            buf.putLong(conflictTerm);
             return buf.array();
         }
 
@@ -158,7 +175,10 @@ public final class RaftRpcMessages {
             byte[] followerBytes = new byte[len];
             buf.get(followerBytes);
             long matchIndex = buf.getLong();
-            return new AppendEntriesResponse(term, success, new String(followerBytes), matchIndex);
+            long conflictIndex = buf.getLong();
+            long conflictTerm = buf.getLong();
+            return new AppendEntriesResponse(term, success, new String(followerBytes),
+                    matchIndex, conflictIndex, conflictTerm);
         }
     }
 }

@@ -14,15 +14,27 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * <p>Implements the complete Raft protocol including:
  * <ul>
- *   <li>Leader election with RequestVote RPCs</li>
+ *   <li>Leader election with RequestVote RPCs and log up-to-date checks</li>
  *   <li>Log replication with AppendEntries RPCs</li>
  *   <li>Commit index advancement via majority agreement</li>
  *   <li>Leader step-down on higher term discovery</li>
- *   <li>Log consistency check and conflict resolution</li>
+ *   <li>Log divergence resolution on leader change (follower truncation)</li>
+ *   <li>No-op entry on leader election for liveness</li>
+ *   <li>Optimized log backtracking with ConflictTerm/ConflictIndex</li>
  * </ul>
  *
- * <p>Unlike Kafka's ZooKeeper/KRaft dependency, TitanMQ embeds Raft directly for
- * zero external dependencies and sub-second failover.
+ * <h3>Leader Crash Mid-Write Safety</h3>
+ * <p>When a leader crashes after appending to its local log but before replicating
+ * to a majority, the entry is NOT committed. On leader change:
+ * <ol>
+ *   <li>The new leader's log is authoritative (it won the election, so its log
+ *       is at least as up-to-date as a majority)</li>
+ *   <li>Followers with divergent entries (from the crashed leader) will have those
+ *       entries truncated when the new leader's AppendEntries RPCs arrive</li>
+ *   <li>The new leader appends a no-op entry in its own term to establish commit
+ *       authority — this is required because Raft only commits entries from the
+ *       current term (§5.4.2), and previous-term entries are committed indirectly</li>
+ * </ol>
  */
 public class RaftNode {
 
@@ -41,6 +53,9 @@ public class RaftNode {
     // Leader state: nextIndex and matchIndex per follower
     private final ConcurrentHashMap<String, Long> nextIndex = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> matchIndex = new ConcurrentHashMap<>();
+
+    // Pending client commands waiting for commit
+    private final ConcurrentHashMap<Long, CompletableFuture<Long>> pendingCommands = new ConcurrentHashMap<>();
 
     // Transport for RPC communication
     private final RaftTransport transport;
@@ -86,10 +101,18 @@ public class RaftNode {
         if (heartbeatTimer != null) heartbeatTimer.cancel(true);
         scheduler.shutdownNow();
         transport.stop();
+
+        // Fail all pending commands
+        pendingCommands.values().forEach(f ->
+                f.completeExceptionally(new IllegalStateException("Node shutting down")));
+        pendingCommands.clear();
+
         log.info("Raft node {} stopped", nodeId);
     }
 
-    // ─── Leader Election ───
+    // ═══════════════════════════════════════════════════════════════
+    //  Leader Election
+    // ═══════════════════════════════════════════════════════════════
 
     /**
      * Called when election timeout fires. Transition to CANDIDATE and request votes.
@@ -106,7 +129,6 @@ public class RaftNode {
         AtomicInteger votesReceived = new AtomicInteger(1); // Vote for self
 
         if (peers.isEmpty()) {
-            // Single-node cluster: win immediately
             becomeLeader();
             return;
         }
@@ -126,7 +148,6 @@ public class RaftNode {
                     });
         }
 
-        // Reset election timer in case we don't win
         resetElectionTimer();
     }
 
@@ -152,6 +173,14 @@ public class RaftNode {
 
     /**
      * Handle an incoming VoteRequest from a candidate.
+     *
+     * <p>Grant vote only if:
+     * <ol>
+     *   <li>Candidate's term >= our term</li>
+     *   <li>We haven't voted for someone else in this term</li>
+     *   <li>Candidate's log is at least as up-to-date as ours (§5.4.1):
+     *       compare last log term first, then last log index</li>
+     * </ol>
      */
     public synchronized VoteResponse handleVoteRequest(VoteRequest request) {
         if (request.term() > currentTerm.get()) {
@@ -161,14 +190,18 @@ public class RaftNode {
         boolean grantVote = false;
         if (request.term() >= currentTerm.get()) {
             if (votedFor == null || votedFor.equals(request.candidateId())) {
-                // Check log is at least as up-to-date
-                if (request.lastLogTerm() > raftLog.lastTerm() ||
+                // Log up-to-date check (§5.4.1)
+                boolean logIsUpToDate =
+                        request.lastLogTerm() > raftLog.lastTerm() ||
                         (request.lastLogTerm() == raftLog.lastTerm() &&
-                                request.lastLogIndex() >= raftLog.lastIndex())) {
+                                request.lastLogIndex() >= raftLog.lastIndex());
+
+                if (logIsUpToDate) {
                     grantVote = true;
                     votedFor = request.candidateId();
                     resetElectionTimer();
-                    log.debug("Node {} granted vote to {} for term {}", nodeId, request.candidateId(), request.term());
+                    log.debug("Node {} granted vote to {} for term {}",
+                            nodeId, request.candidateId(), request.term());
                 }
             }
         }
@@ -176,18 +209,42 @@ public class RaftNode {
         return new VoteResponse(currentTerm.get(), grantVote, nodeId);
     }
 
+    /**
+     * Transition to LEADER state.
+     *
+     * <p>On becoming leader, we:
+     * <ol>
+     *   <li>Initialize nextIndex for each follower to our last log index + 1</li>
+     *   <li>Initialize matchIndex for each follower to -1</li>
+     *   <li>Append a no-op entry in the current term (§8, dissertation §6.4)</li>
+     *   <li>Start sending heartbeats immediately</li>
+     * </ol>
+     *
+     * <p>The no-op entry is critical for liveness: Raft only commits entries from
+     * the current term. Without it, a new leader with uncommitted entries from
+     * previous terms cannot advance the commit index until a new client command
+     * arrives. The no-op ensures the leader can commit previous-term entries
+     * indirectly by committing the no-op (which drags along all preceding entries).
+     */
     private void becomeLeader() {
         if (state == RaftState.LEADER) return;
         state = RaftState.LEADER;
         leaderId = nodeId;
         log.info("Node {} became LEADER for term {}", nodeId, currentTerm.get());
 
-        // Initialize leader state
+        // Initialize leader volatile state
         long lastIdx = raftLog.lastIndex() + 1;
         for (String peerId : peers) {
             nextIndex.put(peerId, lastIdx);
             matchIndex.put(peerId, -1L);
         }
+
+        // Append no-op entry to establish commit authority for this term.
+        // This is the Raft solution to the "previous-term commit" problem:
+        // entries from earlier terms are only committed once a current-term
+        // entry following them is committed.
+        raftLog.append(currentTerm.get(), null); // null command = no-op
+        matchIndex.put(nodeId, raftLog.lastIndex());
 
         // Cancel election timer, start heartbeats
         if (electionTimer != null) electionTimer.cancel(false);
@@ -197,6 +254,10 @@ public class RaftNode {
         leaderChangeListeners.forEach(l -> l.onLeaderChange(nodeId, currentTerm.get()));
     }
 
+    /**
+     * Step down to FOLLOWER on discovering a higher term.
+     * Fails all pending client commands since we're no longer the leader.
+     */
     private void stepDown(long newTerm) {
         log.info("Node {} stepping down, term {} -> {}", nodeId, currentTerm.get(), newTerm);
         currentTerm.set(newTerm);
@@ -206,13 +267,24 @@ public class RaftNode {
             heartbeatTimer.cancel(false);
             heartbeatTimer = null;
         }
+
+        // Fail all pending client commands — they may or may not have been committed.
+        // Clients should retry on the new leader.
+        pendingCommands.values().forEach(f ->
+                f.completeExceptionally(new IllegalStateException(
+                        "Leadership lost during commit. Retry on new leader.")));
+        pendingCommands.clear();
+
         resetElectionTimer();
     }
 
-    // ─── Log Replication ───
+    // ═══════════════════════════════════════════════════════════════
+    //  Log Replication
+    // ═══════════════════════════════════════════════════════════════
 
     /**
-     * Send heartbeats / AppendEntries to all followers.
+     * Send AppendEntries RPCs to all followers.
+     * Called periodically as heartbeats and immediately after new entries are appended.
      */
     private void sendHeartbeats() {
         if (state != RaftState.LEADER) return;
@@ -227,8 +299,8 @@ public class RaftNode {
         long prevIdx = nextIdx - 1;
         long prevTerm = 0;
         if (prevIdx >= 0) {
-            RaftLog.LogEntry prevEntry = raftLog.getEntry(prevIdx);
-            if (prevEntry != null) prevTerm = prevEntry.term();
+            prevTerm = raftLog.termAt(prevIdx);
+            if (prevTerm == -1) prevTerm = 0;
         }
 
         List<RaftLog.LogEntry> entries = raftLog.getEntries(nextIdx);
@@ -243,13 +315,12 @@ public class RaftNode {
                         log.debug("AppendEntries to {} failed: {}", peerId, ex.getMessage());
                         return;
                     }
-                    handleAppendEntriesResponse(peerId, response, entries.size());
+                    handleAppendEntriesResponse(peerId, response);
                 });
     }
 
     private synchronized void handleAppendEntriesResponse(String peerId,
-                                                            AppendEntriesResponse response,
-                                                            int entriesSent) {
+                                                            AppendEntriesResponse response) {
         if (response.term() > currentTerm.get()) {
             stepDown(response.term());
             return;
@@ -266,22 +337,59 @@ public class RaftNode {
             // Try to advance commit index
             advanceCommitIndex();
         } else {
-            // Decrement nextIndex and retry
-            long currentNext = nextIndex.getOrDefault(peerId, 1L);
-            nextIndex.put(peerId, Math.max(0, currentNext - 1));
-            log.debug("AppendEntries rejected by {}, decrementing nextIndex to {}", peerId, currentNext - 1);
+            // Optimized backtracking using ConflictTerm/ConflictIndex (§5.3 optimization).
+            // Instead of decrementing nextIndex by 1 each time (which is O(n) RPCs
+            // for n divergent entries), use the conflict info from the follower.
+            long conflictIndex = response.conflictIndex();
+            long conflictTerm = response.conflictTerm();
+
+            if (conflictTerm > 0) {
+                // Follower has a conflicting entry. Find the last entry in our log
+                // with that term. If we have it, set nextIndex to the entry after it.
+                // If we don't have that term at all, use the follower's conflictIndex.
+                long ourLastOfTerm = -1;
+                for (long i = raftLog.lastIndex(); i >= 0; i--) {
+                    if (raftLog.termAt(i) == conflictTerm) {
+                        ourLastOfTerm = i;
+                        break;
+                    }
+                }
+                if (ourLastOfTerm >= 0) {
+                    nextIndex.put(peerId, ourLastOfTerm + 1);
+                } else {
+                    nextIndex.put(peerId, conflictIndex);
+                }
+            } else {
+                // Follower's log is shorter than prevLogIndex — jump to their log end
+                nextIndex.put(peerId, Math.max(0, conflictIndex));
+            }
+
+            log.debug("AppendEntries rejected by {}, adjusted nextIndex to {}",
+                    peerId, nextIndex.get(peerId));
         }
     }
 
     /**
      * Handle an incoming AppendEntries RPC from the leader.
+     *
+     * <p>This is where log divergence from a crashed leader gets resolved.
+     * If our log has entries that conflict with the leader's, they are truncated
+     * and replaced. This is safe because:
+     * <ul>
+     *   <li>Conflicting entries were never committed (the leader that created them
+     *       crashed before achieving majority replication)</li>
+     *   <li>The new leader's log is authoritative (it won the election with a
+     *       log at least as up-to-date as a majority)</li>
+     * </ul>
      */
     public synchronized AppendEntriesResponse handleAppendEntries(AppendEntriesRequest request) {
+        // §1: Reply false if term < currentTerm
         if (request.term() < currentTerm.get()) {
-            return new AppendEntriesResponse(currentTerm.get(), false, nodeId, raftLog.lastIndex());
+            return new AppendEntriesResponse(currentTerm.get(), false, nodeId,
+                    raftLog.lastIndex(), 0, 0);
         }
 
-        // Valid leader — reset election timer
+        // Valid leader — update state
         if (request.term() > currentTerm.get()) {
             currentTerm.set(request.term());
             votedFor = null;
@@ -290,35 +398,59 @@ public class RaftNode {
         leaderId = request.leaderId();
         resetElectionTimer();
 
-        // Log consistency check
+        // §2: Log consistency check — verify prevLogIndex/prevLogTerm match
         if (request.prevLogIndex() >= 0) {
-            RaftLog.LogEntry prevEntry = raftLog.getEntry(request.prevLogIndex());
-            if (prevEntry == null || prevEntry.term() != request.prevLogTerm()) {
-                return new AppendEntriesResponse(currentTerm.get(), false, nodeId, raftLog.lastIndex());
+            if (request.prevLogIndex() >= raftLog.size()) {
+                // Our log is too short — return conflict info for fast backtracking
+                return new AppendEntriesResponse(currentTerm.get(), false, nodeId,
+                        raftLog.lastIndex(), raftLog.size(), 0);
+            }
+
+            long existingTerm = raftLog.termAt(request.prevLogIndex());
+            if (existingTerm != request.prevLogTerm()) {
+                // Conflict: return the term of the conflicting entry and the first
+                // index of that term, so the leader can skip back efficiently
+                long conflictTerm = existingTerm;
+                long conflictIndex = raftLog.firstIndexOfTerm(conflictTerm);
+                return new AppendEntriesResponse(currentTerm.get(), false, nodeId,
+                        raftLog.lastIndex(), conflictIndex, conflictTerm);
             }
         }
 
-        // Append entries
+        // §3 & §4: Append new entries (with conflict truncation handled by RaftLog)
         if (!request.entries().isEmpty()) {
             raftLog.appendEntries(request.prevLogIndex(), request.prevLogTerm(), request.entries());
         }
 
-        // Update commit index
+        // §5: Update commit index
         if (request.leaderCommit() > raftLog.commitIndex()) {
             raftLog.setCommitIndex(Math.min(request.leaderCommit(), raftLog.lastIndex()));
             applyCommittedEntries();
         }
 
-        return new AppendEntriesResponse(currentTerm.get(), true, nodeId, raftLog.lastIndex());
+        return new AppendEntriesResponse(currentTerm.get(), true, nodeId,
+                raftLog.lastIndex(), 0, 0);
     }
 
     /**
      * Advance the commit index based on majority replication.
+     *
+     * <p>CRITICAL SAFETY PROPERTY (§5.4.2): A leader only commits entries from
+     * its own term. Entries from previous terms are committed indirectly when
+     * a current-term entry following them is committed. This prevents the
+     * scenario where a leader commits a previous-term entry, crashes, and a
+     * new leader overwrites it (the Figure 8 problem from the Raft paper).
+     *
+     * <p>This is why {@link #becomeLeader()} appends a no-op entry — without it,
+     * a new leader with only previous-term entries could never advance the commit index.
      */
     private void advanceCommitIndex() {
+        long oldCommitIndex = raftLog.commitIndex();
+
         for (long n = raftLog.lastIndex(); n > raftLog.commitIndex(); n--) {
-            RaftLog.LogEntry entry = raftLog.getEntry(n);
-            if (entry == null || entry.term() != currentTerm.get()) continue;
+            // Only commit entries from the current term (§5.4.2)
+            long entryTerm = raftLog.termAt(n);
+            if (entryTerm != currentTerm.get()) continue;
 
             // Count replicas (including self)
             int replicaCount = 1;
@@ -332,6 +464,7 @@ public class RaftNode {
             if (replicaCount >= majority) {
                 raftLog.setCommitIndex(n);
                 applyCommittedEntries();
+                completePendingCommands(oldCommitIndex, n);
                 break;
             }
         }
@@ -344,21 +477,42 @@ public class RaftNode {
         while (raftLog.lastApplied() < raftLog.commitIndex()) {
             long nextApply = raftLog.lastApplied() + 1;
             RaftLog.LogEntry entry = raftLog.getEntry(nextApply);
-            if (entry != null) {
+            if (entry != null && entry.command() != null) { // Skip no-op entries
                 for (StateMachineCallback callback : stateMachineCallbacks) {
                     callback.apply(entry.index(), entry.command());
                 }
-                raftLog.setLastApplied(nextApply);
+            }
+            raftLog.setLastApplied(nextApply);
+        }
+    }
+
+    /**
+     * Complete pending client command futures for newly committed entries.
+     */
+    private void completePendingCommands(long oldCommitIndex, long newCommitIndex) {
+        for (long i = oldCommitIndex + 1; i <= newCommitIndex; i++) {
+            CompletableFuture<Long> future = pendingCommands.remove(i);
+            if (future != null) {
+                future.complete(i);
             }
         }
     }
 
-    // ─── Client API ───
+    // ═══════════════════════════════════════════════════════════════
+    //  Client API
+    // ═══════════════════════════════════════════════════════════════
 
     /**
      * Submit a command to the Raft cluster. Only succeeds on the leader.
      *
-     * @return CompletableFuture that completes when the command is committed
+     * <p>The returned future completes when the command is committed by a majority.
+     * If this node loses leadership before the command is committed, the future
+     * completes exceptionally. The client should retry on the new leader.
+     *
+     * <p>Note: a command that was appended but not committed when leadership is lost
+     * may or may not survive. The client must use idempotency keys to handle this.
+     *
+     * @return CompletableFuture that completes with the log index when committed
      */
     public CompletableFuture<Long> submitCommand(byte[] command) {
         if (state != RaftState.LEADER) {
@@ -366,29 +520,29 @@ public class RaftNode {
                     new IllegalStateException("Not the leader. Current leader: " + leaderId));
         }
 
-        long index = raftLog.append(currentTerm.get(), command);
-        matchIndex.put(nodeId, index); // Leader has it
+        long index;
+        synchronized (this) {
+            index = raftLog.append(currentTerm.get(), command);
+            matchIndex.put(nodeId, index);
+        }
+
+        CompletableFuture<Long> future = new CompletableFuture<>();
+        pendingCommands.put(index, future);
 
         // Immediately replicate to followers
         sendHeartbeats();
 
-        // Return future that completes when committed
-        CompletableFuture<Long> future = new CompletableFuture<>();
-        scheduler.scheduleAtFixedRate(() -> {
-            if (raftLog.commitIndex() >= index) {
-                future.complete(index);
-                throw new CancellationException("Done"); // Cancel the scheduled task
-            }
-            if (state != RaftState.LEADER) {
-                future.completeExceptionally(new IllegalStateException("Lost leadership"));
-                throw new CancellationException("Done");
-            }
-        }, 10, 10, TimeUnit.MILLISECONDS);
+        // For single-node clusters, commit immediately
+        if (peers.isEmpty()) {
+            advanceCommitIndex();
+        }
 
         return future;
     }
 
-    // ─── Timer Management ───
+    // ═══════════════════════════════════════════════════════════════
+    //  Timer Management
+    // ═══════════════════════════════════════════════════════════════
 
     private void resetElectionTimer() {
         if (electionTimer != null) electionTimer.cancel(false);
@@ -396,7 +550,9 @@ public class RaftNode {
         electionTimer = scheduler.schedule(this::startElection, timeout, TimeUnit.MILLISECONDS);
     }
 
-    // ─── Callbacks ───
+    // ═══════════════════════════════════════════════════════════════
+    //  Callbacks & Accessors
+    // ═══════════════════════════════════════════════════════════════
 
     public void addLeaderChangeListener(LeaderChangeListener listener) {
         leaderChangeListeners.add(listener);
@@ -406,16 +562,12 @@ public class RaftNode {
         stateMachineCallbacks.add(callback);
     }
 
-    // ─── Accessors ───
-
     public String nodeId() { return nodeId; }
     public RaftState state() { return state; }
     public long currentTerm() { return currentTerm.get(); }
     public String leaderId() { return leaderId; }
     public boolean isLeader() { return state == RaftState.LEADER; }
     public RaftLog raftLog() { return raftLog; }
-
-    // ─── Callback Interfaces ───
 
     @FunctionalInterface
     public interface LeaderChangeListener {

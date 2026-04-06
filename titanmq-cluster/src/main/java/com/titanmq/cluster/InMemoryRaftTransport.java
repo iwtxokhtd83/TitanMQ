@@ -54,7 +54,7 @@ public class InMemoryRaftTransport implements RaftTransport {
             RaftNode peer = NODES.get(peerId);
             if (peer == null) {
                 log.warn("Node {} not found for AppendEntries", peerId);
-                return new AppendEntriesResponse(request.term(), false, peerId, -1);
+                return new AppendEntriesResponse(request.term(), false, peerId, -1, 0, 0);
             }
             return peer.handleAppendEntries(request);
         });

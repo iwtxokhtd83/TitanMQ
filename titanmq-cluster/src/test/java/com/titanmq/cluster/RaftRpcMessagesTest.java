@@ -69,7 +69,7 @@ class RaftRpcMessagesTest {
 
     @Test
     void appendEntriesResponseShouldRoundTrip() {
-        AppendEntriesResponse original = new AppendEntriesResponse(3, true, "node-2", 10);
+        AppendEntriesResponse original = new AppendEntriesResponse(3, true, "node-2", 10, 0, 0);
         byte[] serialized = original.serialize();
         AppendEntriesResponse deserialized = AppendEntriesResponse.deserialize(serialized);
 
@@ -77,5 +77,21 @@ class RaftRpcMessagesTest {
         assertTrue(deserialized.success());
         assertEquals("node-2", deserialized.followerId());
         assertEquals(10, deserialized.matchIndex());
+        assertEquals(0, deserialized.conflictIndex());
+        assertEquals(0, deserialized.conflictTerm());
+    }
+
+    @Test
+    void appendEntriesResponseShouldRoundTripWithConflictInfo() {
+        AppendEntriesResponse original = new AppendEntriesResponse(5, false, "node-3", 7, 3, 2);
+        byte[] serialized = original.serialize();
+        AppendEntriesResponse deserialized = AppendEntriesResponse.deserialize(serialized);
+
+        assertEquals(5, deserialized.term());
+        assertFalse(deserialized.success());
+        assertEquals("node-3", deserialized.followerId());
+        assertEquals(7, deserialized.matchIndex());
+        assertEquals(3, deserialized.conflictIndex());
+        assertEquals(2, deserialized.conflictTerm());
     }
 }
