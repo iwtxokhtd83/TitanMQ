@@ -19,6 +19,9 @@ public class BrokerConfig {
     private boolean enableZeroCopy = true;
     private int backPressureHighWaterMark = 100_000;
     private int backPressureLowWaterMark = 50_000;
+    private String flushPolicy = "PERIODIC"; // EVERY_MESSAGE, PERIODIC, NONE
+    private long retentionHours = -1;  // -1 = infinite
+    private long retentionBytes = -1;  // -1 = infinite
 
     public int port() { return port; }
     public BrokerConfig port(int port) { this.port = port; return this; }
@@ -55,4 +58,13 @@ public class BrokerConfig {
 
     public int backPressureLowWaterMark() { return backPressureLowWaterMark; }
     public BrokerConfig backPressureLowWaterMark(int mark) { this.backPressureLowWaterMark = mark; return this; }
+
+    public String flushPolicy() { return flushPolicy; }
+    public BrokerConfig flushPolicy(String policy) { this.flushPolicy = policy; return this; }
+
+    public long retentionHours() { return retentionHours; }
+    public BrokerConfig retentionHours(long hours) { this.retentionHours = hours; return this; }
+
+    public long retentionBytes() { return retentionBytes; }
+    public BrokerConfig retentionBytes(long bytes) { this.retentionBytes = bytes; return this; }
 }

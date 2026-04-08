@@ -7,14 +7,13 @@ import org.slf4j.LoggerFactory;
 import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.ByteBuffer;
-import java.nio.MappedByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * A single segment of the commit log backed by a memory-mapped file.
+ * A single segment of the commit log backed by a file with optional fsync.
  *
  * <p>Each segment stores messages sequentially with an offset index for fast lookups.
  * Format per entry:
@@ -25,7 +24,7 @@ import java.util.List;
 public class LogSegment {
 
     private static final Logger log = LoggerFactory.getLogger(LogSegment.class);
-    private static final int ENTRY_HEADER_SIZE = 8 + 4; // offset + size
+    static final int ENTRY_HEADER_SIZE = 8 + 4; // offset + size
 
     private final long baseOffset;
     private final Path filePath;
@@ -34,13 +33,19 @@ public class LogSegment {
     private long currentPosition = 0;
     private long endOffset = -1;
     private final long maxSize;
+    private final FlushPolicy flushPolicy;
 
     // Sparse in-memory index: offset -> file position
     private final List<OffsetIndex> index = new ArrayList<>();
 
     public LogSegment(Path directory, long baseOffset, long maxSize) throws IOException {
+        this(directory, baseOffset, maxSize, FlushPolicy.NONE);
+    }
+
+    public LogSegment(Path directory, long baseOffset, long maxSize, FlushPolicy flushPolicy) throws IOException {
         this.baseOffset = baseOffset;
         this.maxSize = maxSize;
+        this.flushPolicy = flushPolicy;
         this.filePath = directory.resolve(String.format("%020d.log", baseOffset));
         this.raf = new RandomAccessFile(filePath.toFile(), "rw");
         this.channel = raf.getChannel();
@@ -62,6 +67,18 @@ public class LogSegment {
 
         currentPosition += ENTRY_HEADER_SIZE + messageSize;
         endOffset = offset;
+
+        if (flushPolicy == FlushPolicy.EVERY_MESSAGE) {
+            channel.force(false);
+        }
+    }
+
+    /**
+     * Force flush buffered data to disk.
+     * Called by CommitLog's periodic flush thread when using PERIODIC flush policy.
+     */
+    public synchronized void flush() throws IOException {
+        channel.force(false);
     }
 
     public List<TitanMessage> read(long fromOffset, int maxMessages) throws IOException {
@@ -91,8 +108,42 @@ public class LogSegment {
         return messages;
     }
 
+    /**
+     * Recover segment state by scanning the file from the beginning.
+     * Rebuilds the in-memory index and recovers currentPosition/endOffset.
+     */
+    void recover() throws IOException {
+        long fileSize = channel.size();
+        long pos = 0;
+        index.clear();
+        endOffset = -1;
+
+        while (pos + ENTRY_HEADER_SIZE <= fileSize) {
+            ByteBuffer header = ByteBuffer.allocate(ENTRY_HEADER_SIZE);
+            int bytesRead = channel.read(header, pos);
+            if (bytesRead < ENTRY_HEADER_SIZE) break;
+            header.flip();
+
+            long offset = header.getLong();
+            int messageSize = header.getInt();
+
+            if (messageSize <= 0 || pos + ENTRY_HEADER_SIZE + messageSize > fileSize) {
+                // Truncated entry (partial write before crash) — truncate file here
+                log.warn("Truncated entry at position {} in {}, truncating segment", pos, filePath);
+                channel.truncate(pos);
+                break;
+            }
+
+            index.add(new OffsetIndex(offset, pos));
+            endOffset = offset;
+            pos += ENTRY_HEADER_SIZE + messageSize;
+        }
+
+        currentPosition = pos;
+        log.info("Recovered segment {}: {} entries, endOffset={}", filePath.getFileName(), index.size(), endOffset);
+    }
+
     private long findPosition(long targetOffset) {
-        // Binary search on sparse index
         long pos = 0;
         int lo = 0, hi = index.size() - 1;
         while (lo <= hi) {
@@ -107,6 +158,16 @@ public class LogSegment {
         return pos;
     }
 
+    /**
+     * Delete this segment's file from disk.
+     */
+    public void delete() throws IOException {
+        close();
+        if (!filePath.toFile().delete()) {
+            log.warn("Failed to delete segment file {}", filePath);
+        }
+    }
+
     public long size() { return currentPosition; }
     public long baseOffset() { return baseOffset; }
     public long endOffset() { return endOffset; }
@@ -117,5 +178,5 @@ public class LogSegment {
         raf.close();
     }
 
-    private record OffsetIndex(long offset, long position) {}
+    record OffsetIndex(long offset, long position) {}
 }

@@ -50,6 +50,9 @@ public class RaftNode {
     // Raft log
     private final RaftLog raftLog = new RaftLog();
 
+    // Persistent state (survives restarts)
+    private final RaftPersistence persistence;
+
     // Leader state: nextIndex and matchIndex per follower
     private final ConcurrentHashMap<String, Long> nextIndex = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Long> matchIndex = new ConcurrentHashMap<>();
@@ -74,20 +77,46 @@ public class RaftNode {
     private final List<LeaderChangeListener> leaderChangeListeners = new CopyOnWriteArrayList<>();
 
     public RaftNode(String nodeId, List<String> peers, RaftTransport transport) {
+        this(nodeId, peers, transport, null);
+    }
+
+    public RaftNode(String nodeId, List<String> peers, RaftTransport transport, RaftPersistence persistence) {
         this.nodeId = nodeId;
         this.peers = new ArrayList<>(peers);
         this.transport = transport;
+        this.persistence = persistence;
         this.baseElectionTimeoutMs = 300 + random.nextInt(200); // 300-500ms
     }
 
     /**
-     * Convenience constructor for single-node or test scenarios.
+     * Convenience constructor for single-node or test scenarios (no persistence).
      */
     public RaftNode(String nodeId, List<String> peers) {
-        this(nodeId, peers, new InMemoryRaftTransport(nodeId));
+        this(nodeId, peers, new InMemoryRaftTransport(nodeId), null);
     }
 
     public void start() {
+        // Recover persisted state if available
+        if (persistence != null) {
+            try {
+                RaftPersistence.MetaState meta = persistence.loadMeta();
+                if (meta != null) {
+                    currentTerm.set(meta.currentTerm());
+                    votedFor = meta.votedFor();
+                    log.info("Recovered Raft meta: term={}, votedFor={}", meta.currentTerm(), meta.votedFor());
+                }
+                List<RaftLog.LogEntry> entries = persistence.loadLogEntries();
+                for (RaftLog.LogEntry entry : entries) {
+                    raftLog.append(entry.term(), entry.command());
+                }
+                if (!entries.isEmpty()) {
+                    log.info("Recovered {} Raft log entries, lastIndex={}", entries.size(), raftLog.lastIndex());
+                }
+            } catch (java.io.IOException e) {
+                log.error("Failed to recover Raft state, starting fresh", e);
+            }
+        }
+
         transport.start();
         if (transport instanceof InMemoryRaftTransport) {
             InMemoryRaftTransport.registerNode(nodeId, this);
@@ -122,6 +151,7 @@ public class RaftNode {
         long term = currentTerm.incrementAndGet();
         votedFor = nodeId;
         leaderId = null;
+        persistMeta();
         log.info("Node {} starting election for term {}", nodeId, term);
 
         int clusterSize = peers.size() + 1;
@@ -199,6 +229,7 @@ public class RaftNode {
                 if (logIsUpToDate) {
                     grantVote = true;
                     votedFor = request.candidateId();
+                    persistMeta();
                     resetElectionTimer();
                     log.debug("Node {} granted vote to {} for term {}",
                             nodeId, request.candidateId(), request.term());
@@ -244,6 +275,7 @@ public class RaftNode {
         // entries from earlier terms are only committed once a current-term
         // entry following them is committed.
         raftLog.append(currentTerm.get(), null); // null command = no-op
+        persistLogEntry(raftLog.getEntry(raftLog.lastIndex()));
         matchIndex.put(nodeId, raftLog.lastIndex());
 
         // Cancel election timer, start heartbeats
@@ -263,6 +295,7 @@ public class RaftNode {
         currentTerm.set(newTerm);
         state = RaftState.FOLLOWER;
         votedFor = null;
+        persistMeta();
         if (heartbeatTimer != null) {
             heartbeatTimer.cancel(false);
             heartbeatTimer = null;
@@ -523,6 +556,7 @@ public class RaftNode {
         long index;
         synchronized (this) {
             index = raftLog.append(currentTerm.get(), command);
+            persistLogEntry(raftLog.getEntry(index));
             matchIndex.put(nodeId, index);
         }
 
@@ -538,6 +572,30 @@ public class RaftNode {
         }
 
         return future;
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Persistence Helpers
+    // ═══════════════════════════════════════════════════════════════
+
+    private void persistMeta() {
+        if (persistence != null) {
+            try {
+                persistence.saveMeta(currentTerm.get(), votedFor);
+            } catch (java.io.IOException e) {
+                log.error("Failed to persist Raft meta", e);
+            }
+        }
+    }
+
+    private void persistLogEntry(RaftLog.LogEntry entry) {
+        if (persistence != null && entry != null) {
+            try {
+                persistence.appendLogEntry(entry);
+            } catch (java.io.IOException e) {
+                log.error("Failed to persist Raft log entry {}", entry.index(), e);
+            }
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════

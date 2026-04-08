@@ -148,3 +148,18 @@ mvn -pl titanmq-benchmark exec:java -Dexec.mainClass="com.titanmq.benchmark.Thro
 ## License
 
 Apache License 2.0
+
+## Changelog
+
+### v1.1.0 (2026-04-08)
+
+- **fix**: CommitLog now recovers existing segments on restart — data survives broker restarts (#5)
+- **fix**: Added configurable fsync (EVERY_MESSAGE / PERIODIC / NONE) — messages survive OS crashes (#6)
+- **fix**: Raft state (currentTerm, votedFor, log entries) persisted to disk — cluster survives restarts (#7)
+- **fix**: BackPressureController uses CAS loop — in-flight count guaranteed to never exceed watermark (#8)
+- **fix**: Segment retention (time-based and size-based) — disk usage no longer grows unbounded (#9)
+- **feat**: LogSegment.recover() rebuilds in-memory index from existing segment files
+- **feat**: LogSegment.delete() for segment cleanup
+- **feat**: RaftPersistence for atomic meta and log entry persistence
+- **feat**: FlushPolicy enum for configurable durability
+- **feat**: BrokerConfig extended with flushPolicy, retentionHours, retentionBytes

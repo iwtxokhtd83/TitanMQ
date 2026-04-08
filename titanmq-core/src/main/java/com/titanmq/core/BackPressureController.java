@@ -6,17 +6,19 @@ import org.slf4j.LoggerFactory;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
- * Adaptive back-pressure controller.
+ * Adaptive back-pressure controller using lock-free CAS operations.
  *
- * <p>Monitors in-flight message count and applies flow control when thresholds are exceeded.
- * This prevents OOM conditions and cascading failures that plague Kafka under heavy load.
- *
- * <p>Strategy:
+ * <p>Uses a dual-watermark system with a continuous throttle ratio signal:
  * <ul>
- *   <li>When in-flight exceeds high watermark: reject new messages (producer gets back-pressure signal)</li>
- *   <li>When in-flight drops below low watermark: resume accepting messages</li>
- *   <li>Gradual throttling between watermarks for smooth degradation</li>
+ *   <li>Below low watermark: full speed (throttleRatio = 0.0)</li>
+ *   <li>Between watermarks: gradual throttling (0.0–1.0)</li>
+ *   <li>Above high watermark: reject (tryAcquire returns false)</li>
  * </ul>
+ *
+ * <p>The hysteresis gap between watermarks prevents oscillation.
+ *
+ * <p>Thread safety: all operations are lock-free using CAS loops.
+ * The in-flight count is guaranteed to never exceed the high watermark.
  */
 public class BackPressureController {
 
@@ -38,19 +40,27 @@ public class BackPressureController {
     /**
      * Try to acquire a slot for a new message.
      *
+     * <p>Uses a CAS loop to atomically check-and-increment, guaranteeing the
+     * in-flight count never exceeds the high watermark — even under heavy
+     * concurrent load from multiple threads.
+     *
      * @return true if the message can proceed, false if back-pressure is active
      */
     public boolean tryAcquire() {
-        long current = inFlightCount.incrementAndGet();
-        if (current > highWaterMark) {
-            if (!throttled) {
-                throttled = true;
-                log.warn("Back-pressure activated: in-flight={}, highWaterMark={}", current, highWaterMark);
+        while (true) {
+            long current = inFlightCount.get();
+            if (current >= highWaterMark) {
+                if (!throttled) {
+                    throttled = true;
+                    log.warn("Back-pressure activated: in-flight={}, highWaterMark={}", current, highWaterMark);
+                }
+                return false;
             }
-            inFlightCount.decrementAndGet();
-            return false;
+            if (inFlightCount.compareAndSet(current, current + 1)) {
+                return true;
+            }
+            // CAS failed — another thread modified the count, retry
         }
-        return true;
     }
 
     /**
