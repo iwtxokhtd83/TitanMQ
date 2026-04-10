@@ -4,6 +4,7 @@ import com.titanmq.common.config.BrokerConfig;
 import com.titanmq.core.BackPressureController;
 import com.titanmq.core.ConsumerGroupManager;
 import com.titanmq.core.TopicManager;
+import com.titanmq.routing.ExchangeManager;
 import com.titanmq.protocol.codec.TitanMessageDecoder;
 import com.titanmq.protocol.codec.TitanMessageEncoder;
 import io.netty.bootstrap.ServerBootstrap;
@@ -31,17 +32,20 @@ public class BrokerNetworkServer {
     private final TopicManager topicManager;
     private final ConsumerGroupManager consumerGroupManager;
     private final BackPressureController backPressureController;
+    private final ExchangeManager exchangeManager;
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
     public BrokerNetworkServer(BrokerConfig config, TopicManager topicManager,
                                 ConsumerGroupManager consumerGroupManager,
-                                BackPressureController backPressureController) {
+                                BackPressureController backPressureController,
+                                ExchangeManager exchangeManager) {
         this.config = config;
         this.topicManager = topicManager;
         this.consumerGroupManager = consumerGroupManager;
         this.backPressureController = backPressureController;
+        this.exchangeManager = exchangeManager;
     }
 
     public void start() throws InterruptedException {
@@ -62,7 +66,8 @@ public class BrokerNetworkServer {
                                 .addLast("decoder", new TitanMessageDecoder())
                                 .addLast("encoder", new TitanMessageEncoder())
                                 .addLast("handler", new BrokerRequestHandler(
-                                        topicManager, consumerGroupManager, backPressureController));
+                                        topicManager, consumerGroupManager,
+                                        backPressureController, exchangeManager));
                     }
                 });
 

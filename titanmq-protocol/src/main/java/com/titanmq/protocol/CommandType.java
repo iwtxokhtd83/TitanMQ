@@ -20,6 +20,9 @@ public enum CommandType {
     DELETE_TOPIC((byte) 0x21),
     DESCRIBE_TOPIC((byte) 0x22),
     ADMIN_RESPONSE((byte) 0x23),
+    DECLARE_EXCHANGE((byte) 0x24),
+    BIND_EXCHANGE((byte) 0x25),
+    UNBIND_EXCHANGE((byte) 0x26),
 
     // Cluster commands
     HEARTBEAT((byte) 0x30),

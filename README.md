@@ -151,6 +151,14 @@ Apache License 2.0
 
 ## Changelog
 
+### v1.2.0 (2026-04-10)
+
+- **feat**: Routing engine fully integrated into broker — exchanges are no longer dead code (#10)
+- **feat**: ExchangeManager for declaring, binding, and routing through named exchanges
+- **feat**: DECLARE_EXCHANGE, BIND_EXCHANGE, UNBIND_EXCHANGE wire protocol commands
+- **feat**: PRODUCE auto-routes through exchange when target topic matches a declared exchange
+- **feat**: Falls back to direct topic write when no exchange is configured (backward compatible)
+
 ### v1.1.0 (2026-04-08)
 
 - **fix**: CommitLog now recovers existing segments on restart — data survives broker restarts (#5)

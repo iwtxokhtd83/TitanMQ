@@ -5,6 +5,7 @@ import com.titanmq.core.BackPressureController;
 import com.titanmq.core.ConsumerGroupManager;
 import com.titanmq.core.TopicManager;
 import com.titanmq.cluster.RaftNode;
+import com.titanmq.routing.ExchangeManager;
 import com.titanmq.store.OffsetStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -35,6 +36,7 @@ public class TitanBroker {
     private final BackPressureController backPressureController;
     private final OffsetStore offsetStore;
     private final RaftNode raftNode;
+    private final ExchangeManager exchangeManager;
     private BrokerNetworkServer networkServer;
 
     public TitanBroker(BrokerConfig config) {
@@ -51,6 +53,7 @@ public class TitanBroker {
                 config.backPressureLowWaterMark()
         );
         this.raftNode = new RaftNode(nodeId, peers);
+        this.exchangeManager = new ExchangeManager();
     }
 
     public void start() throws IOException, InterruptedException {
@@ -64,7 +67,8 @@ public class TitanBroker {
         raftNode.start();
 
         // Start network server
-        networkServer = new BrokerNetworkServer(config, topicManager, consumerGroupManager, backPressureController);
+        networkServer = new BrokerNetworkServer(config, topicManager, consumerGroupManager,
+                backPressureController, exchangeManager);
         networkServer.start();
 
         log.info("TitanMQ Broker started successfully");
@@ -81,6 +85,7 @@ public class TitanBroker {
     public TopicManager topicManager() { return topicManager; }
     public ConsumerGroupManager consumerGroupManager() { return consumerGroupManager; }
     public BackPressureController backPressureController() { return backPressureController; }
+    public ExchangeManager exchangeManager() { return exchangeManager; }
 
     public static void main(String[] args) throws Exception {
         BrokerConfig config = new BrokerConfig();
